@@ -59,7 +59,7 @@ volatile u32 clkn;                       // clkn 3200 Hz counter
 #define CS_HOLD_TIME  2                     // min pkts to send on trig (>=1)
 u8 hop_mode = HOP_NONE;
 volatile u8 do_hop = 0;                     // set by timer interrupt
-u8 le_hop_after = 0;                        // hop after this many 1.25 ms cycles
+
 u8 cs_no_squelch = 0;                       // rx all packets if set
 int8_t cs_threshold_req=CS_THRESHOLD_DEFAULT; // requested CS threshold in dBm
 int8_t cs_threshold_cur=CS_THRESHOLD_DEFAULT; // current CS threshold in dBm
@@ -94,7 +94,9 @@ le_state_t le = {
 	.crc_init  = 0x555555,                  // advertising channel CRCInit
 	.crc_init_reversed = 0xAAAAAA,
 	.crc_verify = 1,
-	.connected = 0,
+
+	.link_state = LINK_INACTIVE,
+	.conn_epoch = 0,
 	.target_set = 0,
 	.last_packet = 0,
 };
@@ -730,8 +732,15 @@ static int vendor_request_handler(u8 request, u16 *request_params, u8 *data, int
 		break;
 
 	case UBERTOOTH_BTLE_SET_TARGET:
+		// Addresses appear in packets in reverse-octet order
+		// Store the target address in reverse order so that we can do a simple memcmp later
+	        le.target[0] = data[5];
+		le.target[1] = data[4];
+		le.target[2] = data[3];
+		le.target[3] = data[2];
+		le.target[4] = data[1];
+		le.target[5] = data[0];
 		le.target_set = 1;
-		memcpy(le.target, data, 6);
 		break;
 
 	default:
@@ -779,11 +788,13 @@ void TIMER0_IRQHandler()
 {
 	// Use non-volatile working register to shave off a couple instructions
 	u32 next;
+	u32 le_clk;
 
 	if (T0IR & TIR_MR0_Interrupt) {
 
 		clkn++;
 		next = clkn;
+		le_clk = (next - le.conn_epoch) & 0x03;
 
 		/* Trigger hop based on mode */
 
@@ -799,10 +810,13 @@ void TIMER0_IRQHandler()
 		}
 		/* BLUETOOTH Low Energy -> 7.5ms - 4.0s in multiples of 1.25 ms */
 		else if (hop_mode == HOP_BTLE) {
-			if ((next & 0x3) == 0) {
-				if (le_hop_after > 0 && --le_hop_after == 0) {
+			//Only hop if connected
+			if ((LINK_CONNECTED == le.link_state) && (0 == le_clk)) {
+				--le.interval_timer;
+				if (0 == le.interval_timer) {
 					do_hop = 1;
-					le_hop_after = le.hop_interval;
+					++le.conn_count;
+					le.interval_timer = le.conn_interval;
 				} else {
 					TXLED_CLR; // hack!
 				}
@@ -1617,11 +1631,11 @@ void reset_le() {
 	le.crc_init  = 0x555555;               // advertising channel CRCInit
 	le.crc_init_reversed = 0xAAAAAA;
 	le.crc_verify = 1;
-	le.connected = 0;
 	le.target_set = 0;
+	le.link_state = LINK_INACTIVE;
 	le.last_packet = 0;
 
-	le_hop_after = 0;
+	le.conn_epoch = 0;
 	do_hop = 0;
 }
 
@@ -1780,6 +1794,8 @@ void bt_le_sync(u8 active_mode)
 	modulation = MOD_BT_LOW_ENERGY;
 	mode = active_mode;
 
+	le.link_state = LINK_LISTENING;
+
 	// enable USB interrupts
 	ISER0 = ISER0_ISE_USB;
 
@@ -1883,10 +1899,10 @@ void bt_le_sync(u8 active_mode)
 				goto rx_flush;
 		}
 
-		enqueue(LE_PACKET, (uint8_t *)packet);
 
 		RXLED_SET;
 		packet_cb((uint8_t *)packet);
+		enqueue(LE_PACKET, (uint8_t *)packet);
 		le.last_packet = CLK100NS;
 
 	rx_flush:
@@ -1900,7 +1916,9 @@ void bt_le_sync(u8 active_mode)
 		}
 
 		// timeout - FIXME this is an ugly hack
-		if (le.connected && (CLK100NS - le.last_packet) > 50000000) {
+		if (((LINK_CONNECTED == le.link_state) || (LINK_CONN_PENDING == le.link_state)) 
+			&& ((CLK100NS - le.last_packet) > 50000000))
+		{
 			reset_le();
 
 			cc2400_strobe(SRFOFF);
@@ -2001,31 +2019,96 @@ int cb_follow_le() {
 }
 
 /**
- * Called when we recieve a packet in connection following mode.
+ * Called when we receive a packet in connection following mode.
  */
 void connection_follow_cb(u8 *packet) {
 	int i;
-	int type;
 	u32 aa = 0;
 
-	if (le.connected) {
-		// hop (8 * 1.25) = 10 ms after we see a packet on this channel
-		if (le_hop_after == 0)
-			le_hop_after = le.hop_interval / 2;
-	}
+#define ADV_ADDRESS_IDX 0
+#define HEADER_IDX 4
+#define DATA_LEN_IDX 5
+#define DATA_START_IDX 6
+	
+	u8 *adv_addr = &packet[ADV_ADDRESS_IDX];
+	u8 header = packet[HEADER_IDX];
+	u8 *data_len = &packet[DATA_LEN_IDX];
+	u8 *data = &packet[DATA_START_IDX];
+	u8 *crc = &packet[DATA_START_IDX + *data_len];
+	
+	if (LINK_CONN_PENDING == le.link_state) {
+		// We received a packet in the connection pending state, so now the device *should* be connected
+		le.link_state = LINK_CONNECTED;
+		le.conn_epoch = clkn;
+		le.interval_timer = le.conn_interval - 1;
+		le.conn_count = 0;
+		le.update_pending = 0;
 
-	type = packet[4] & 0xf;
+	} else if (LINK_CONNECTED == le.link_state) {
+		u8 llid =  header & 0x03;
 
-	// connect packet
-	if (!le.connected && type == 0x05) {
+		// Apply any connection parameter update if necessary
+		if (le.update_pending && (le.conn_count == le.update_instant)) {
+		        // This is the first packet received in the connection interval for which the new parameters apply
+			le.conn_epoch = clkn;
+			le.conn_interval = le.interval_update;
+			le.interval_timer = le.interval_update - 1;
+			le.win_size = le.win_size_update;
+			le.win_offset = le.win_offset_update;
+			le.update_pending = 0;
+		}
+
+		if ((0x01 == llid) && (0 == *data_len)) {
+			// Packet is empty PDU, so stuff some data in for debugging
+			data[0] = le.channel_idx;
+			data[1] = (le.conn_interval >> 8) & 0xFF;
+			data[2] = (le.conn_interval >> 0) & 0xFF;
+			data[3] = (le.interval_timer >> 8) & 0xFF;
+			data[4] = (le.interval_timer >> 0) & 0xFF;
+			data[5] = (le.conn_count >> 8) & 0xFF;
+			data[6] = (le.conn_count >> 0) & 0xFF;
+			data[7] = (le.update_instant - le.conn_count);
+			memcpy(&data[8], "\xFA\xCA\xDE", 3); // Fake CRC
+			*data_len = 8;
+		} else if ((0x03 == llid) && (0x00 == data[0])) {
+			//This is a CONNECTION_UPDATE_REQ
+			//The host is changing the connection parameters
+			le.win_size_update = packet[7];
+			le.win_offset_update = packet[8] + ((u16)packet[9] << 8);
+			le.interval_update = packet[10] + ((u16)packet[11] << 8);
+			le.update_instant = packet[16] + ((u16)packet[17] << 8);
+			if ((le.update_instant - le.conn_count) < 32767) {
+				le.update_pending = 1;
+			}
+		}
+
+	} else if (LINK_LISTENING == le.link_state) {
+		u8 pkt_type = packet[4] & 0x0F;
+        	if (0x05 == pkt_type) {
+		// This is a connect packet
 		// if we have a target, see if InitA or AdvA matches
-		if (le.target_set &&
-			!(memcmp(le.target, &packet[6], 6) == 0 ||
-			  memcmp(le.target, &packet[12], 6) == 0)) {
+			if (!le.target_set) {
+				packet[34] = 0x00;
+				packet[35] = 0xDE;
+				packet[36] = 0xAD;
+				packet[37] = 0x00;
+				packet[38] = 0x00;
+				return;
+			}
+			if (0 == memcmp(le.target, &packet[6], 6)) {
+				//Matched the Initiator
+				memset(&packet[6], 0, 6);
+			} else if (0 == memcmp(le.target, &packet[12], 6)) {
+				//Matched the Advertiser
+				memset(&packet[12], 0, 6);
+			} else {
+				//Neither address matches
+				memcpy(&packet[34], &le.target[0], 6);
+
 			return;
 		}
 
-		le.connected = 1;
+		le.link_state = LINK_CONN_PENDING;
 		le.crc_verify = 0; // we will drop many packets if we attempt to filter by CRC
 
 		for (i = 0; i < 4; ++i)
@@ -2038,16 +2121,22 @@ void connection_follow_cb(u8 *packet) {
 					|  packet[CRC_INIT+0];
 		le.crc_init_reversed = rbit(le.crc_init);
 
+#define WIN_SIZE (2+4+6+6+4+3)
+			le.win_size = packet[WIN_SIZE];
+
 #define WIN_OFFSET (2+4+6+6+4+3+1)
-		// le_hop_after = idle_rxbuf[WIN_OFFSET]-2;
-		do_hop = 1;
+			le.win_offset = packet[WIN_OFFSET];
 
-#define HOP_INTERVAL (2+4+6+6+4+3+1+2)
-		le.hop_interval = packet[HOP_INTERVAL];
+#define CONN_INTERVAL (2+4+6+6+4+3+1+2)
+			le.conn_interval = packet[CONN_INTERVAL];
 
-#define HOP (2+4+6+6+4+3+1+2+2+2+2+5)
-		le.hop_increment = packet[HOP] & 0x1f;
-		le.channel_idx = le.hop_increment;
+#define CHANNEL_INC (2+4+6+6+4+3+1+2+2+2+2+5)
+			le.channel_increment = packet[CHANNEL_INC] & 0x1f;
+			le.channel_idx = le.channel_increment;
+
+			//Hop to the initial channel immediately
+			do_hop = 1;
+		}
 	}
 }
 
@@ -2074,6 +2163,7 @@ void le_promisc_state(u8 type, void *data, unsigned len) {
 	enqueue(LE_PROMISC, buf);
 }
 
+#if 0
 // divide, rounding to the nearest integer: round up at 0.5.
 #define DIVIDE_ROUND(N, D) ((N) + (D)/2) / (D)
 
@@ -2309,6 +2399,8 @@ void bt_promisc_le() {
 	bt_le_sync(MODE_BT_PROMISC_LE);
 }
 
+#endif
+
 void bt_slave_le() {
 	u32 calc_crc;
 	int i;
@@ -2495,7 +2587,9 @@ int main()
 					bt_follow_le();
 					break;
 				case MODE_BT_PROMISC_LE:
+#if 0
 					bt_promisc_le();
+#endif
 					break;
 				case MODE_BT_SLAVE_LE:
 					bt_slave_le();
